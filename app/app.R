@@ -2,9 +2,11 @@ library(shiny)
 library(leaflet)
 library(raster)
 library(sf)
+library(dplyr)
+library(shinyjs)
 
 # Load your raster data here
-files_list <- list.files("~/Desktop/Git/distant shiny/cuzin-roudy_et_al-2014", full.names = TRUE)
+files_list <- list.files("~/Desktop/Git/Shiny-DistAnt/data", full.names = TRUE, recursive = TRUE, pattern = ".tif$")
 raster_data <- lapply(files_list, raster)
 
 # Define the complex polygon in WKT format
@@ -12,35 +14,38 @@ polygon_wkt <- 'POLYGON((180 -44.3, 173 -44.3, 173 -47.5, 170 -47.5, 157 -47.5, 
 # Parse the WKT string into a polygon object
 polygon <- st_as_sfc(polygon_wkt)
 
+# Load the CSV file containing the species names
+species_info <- read.csv("metadata.csv")
+
+# Create a tibble to store the file names and taxon names and filter to keep only the rows corresponding to the raster files
+taxon_lookup <- tibble(file = species_info$file, taxon = species_info$taxon) %>%
+  filter(file %in% basename(files_list))
+
 # Define UI
 ui <- fluidPage(
-  titlePanel("DistAnt - Species distribution model outputs viewer"),
+  titlePanel("DistAnt - Ecological model outputs viewer"),
   sidebarLayout(
     sidebarPanel(
       # Input element for selecting species
-      tags$h3("Choose your species"),
-      selectInput("species", "Select species", choices = basename(files_list)),
+      tags$h3("Choose your model output"),
+      selectInput("species", "Select file", choices = basename(files_list)),
       hr(), # Add a horizontal line separator
       checkboxGroupInput("specific_areas", "Toggle specific areas",
-                         choices = c("Antarctic Peninsula", "Wedell Sea")),
+                         choices = c("MEASO polygon","Antarctic Peninsula", "Wedell Sea")),
       checkboxGroupInput("ccamlr_areas", "Toggle CCAMLR areas",
                          choices = c("Convention area", "High seas area")),
-      checkboxInput("toggle_polygon", "Toggle MEASO polygon"),
       hr(), # Add a horizontal line separator
       # Title for custom bounding box creation section
       tags$h3("Create a custom bounding box"),
       # New sidebar panel for creating custom bounding box
-      numericInput("bbox_lat1", "Latitude 1 (bottom)", value = 0),
-      numericInput("bbox_lat2", "Latitude 2 (top)", value = 0),
-      numericInput("bbox_lng1", "Longitude 1 (right)", value = 0),
-      numericInput("bbox_lng2", "Longitude 2 (left)", value = 0),
+      sliderInput("bbox_lat1", "Latitude 1 - Bottom", min = -90, max = 90, value = 0),
+      sliderInput("bbox_lat2", "Latitude 2 - Top", min = -90, max = 90, value = 0),
+      sliderInput("bbox_lng1", "Longitude 1 - Left", min = -180, max = 180, value = 0),
+      sliderInput("bbox_lng2", "Longitude 2 - Right", min = -180, max = 180, value = 0),
       actionButton("add_bbox", "Add custom bounding box"),
-      checkboxInput("toggle_custom_bbox", "Toggle custom bounding boxes"),
-      conditionalPanel(
-        condition = "input.toggle_custom_bbox",
-        uiOutput("bbox_toggle_buttons")
-      ),
-      downloadButton("download_cropped_raster", "Download Cropped Raster")
+      tags$div(id = "toggle_bbox_buttons", style = "display: none;",
+               uiOutput("bbox_toggle_buttons")),
+      downloadButton("download_cropped_raster", "Download custom area")
     ),
     mainPanel(
       # Leaflet map output
@@ -59,6 +64,17 @@ server <- function(input, output, session) {
   rv <- reactiveValues(bboxes = list(), bbox_visibility = list())
   cropped_raster <- reactiveVal(NULL)
   
+  observe({
+    # Find the extent of the selected raster
+    selected_raster <- raster_data[[which(basename(files_list) == input$species)]]
+    extent_selected <- extent(selected_raster)
+    # Update slider values based on extent
+    updateSliderInput(session, "bbox_lat1", value = extent_selected@ymin, min = extent_selected@ymin, max = extent_selected@ymax)
+    updateSliderInput(session, "bbox_lat2", value = extent_selected@ymax, min = extent_selected@ymin, max = extent_selected@ymax)
+    updateSliderInput(session, "bbox_lng1", value = extent_selected@xmin, min = extent_selected@xmin, max = extent_selected@xmax)
+    updateSliderInput(session, "bbox_lng2", value = extent_selected@xmax, min = extent_selected@xmin, max = extent_selected@xmax)
+  })
+  
   output$map <- renderLeaflet({
     # Create a Leaflet map
     map <- leaflet() %>%
@@ -67,6 +83,15 @@ server <- function(input, output, session) {
       # Add raster layer to the map based on the selected species
       addRasterImage(raster_data[[which(basename(files_list) == input$species)]],
                      colors = "viridis")
+    
+    # Add custom bounding box if it exists and is visible
+    if (!is.null(rv$bbox) && rv$bbox_visibility) {
+      map <- map %>% addRectangles(
+        lng1 = rv$bbox$lng1, lat1 = rv$bbox$lat1,
+        lng2 = rv$bbox$lng2, lat2 = rv$bbox$lat2,
+        stroke = TRUE, fill = FALSE, color = "green"
+      )
+    }
     
     # Add bounding boxes for protected areas based on selected checkboxes
     if ("Antarctic Peninsula" %in% input$specific_areas) {
@@ -97,14 +122,14 @@ server <- function(input, output, session) {
     }
     
     # Add the complex polygon if the toggle is checked
-    if (input$toggle_polygon) {
+    if ("MEASO polygon" %in% input$specific_areas) {
       map <- map %>% addPolygons(data = polygon, color = "grey", fill = FALSE)
     }
     
     # Add bounding boxes for CCAMLR areas based on selected checkboxes
     if ("Convention area" %in% input$ccamlr_areas) {
       map <- map %>% addRectangles(
-        lng1 = 20, lat1 = -60,  # Lower left corner of bounding box 1
+        lng1 = 0, lat1 = -60,  # Lower left corner of bounding box 1
         lng2 = 180, lat2 = -45,  # Upper right corner of bounding box 1
         stroke = TRUE, fill = FALSE, color = "red"
       )
@@ -113,8 +138,8 @@ server <- function(input, output, session) {
     # Add bounding boxes for CCAMLR areas based on selected checkboxes
     if ("High seas area" %in% input$ccamlr_areas) {
       map <- map %>% addRectangles(
-        lng1 = 30, lat1 = -60,  # Lower left corner of bounding box 1
-        lng2 = 160, lat2 = -45,  # Upper right corner of bounding box 1
+        lng1 = 180, lat1 = -60,  # Lower left corner of bounding box 1
+        lng2 = -180, lat2 = -45,  # Upper right corner of bounding box 1
         stroke = TRUE, fill = FALSE, color = "red"
       )
     }
@@ -123,8 +148,7 @@ server <- function(input, output, session) {
     map <- map %>% addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE))
     
     # Update the name of the currently visualized species
-    selected_species(basename(files_list)[which(basename(files_list) == input$species)])
-    
+    selected_species(taxon_lookup$taxon[taxon_lookup$file == input$species])
     
     return(map)
   })
@@ -139,27 +163,8 @@ server <- function(input, output, session) {
       lng1 = input$bbox_lng1, lat1 = input$bbox_lat1,
       lng2 = input$bbox_lng2, lat2 = input$bbox_lat2
     )
-    rv$bboxes <- c(rv$bboxes, list(bbox))
-    rv$bbox_visibility <- c(rv$bbox_visibility, list(TRUE))
-  })
-  
-  # Event handler for toggling custom bounding box visibility
-  observeEvent(input$toggle_bbox, {
-    rv$bbox_visibility[[input$toggle_bbox]] <- !rv$bbox_visibility[[input$toggle_bbox]]
-  })
-  
-  # Event handler for cropping raster to custom bounding box
-  observeEvent(input$download_cropped_raster, {
-    if (!is.null(cropped_raster())) {
-      downloadHandler(
-        filename = function() {
-          paste("cropped_raster_", Sys.Date(), ".tif", sep = "")
-        },
-        content = function(file) {
-          writeRaster(cropped_raster(), filename = file, format = "GTiff")
-        }
-      )
-    }
+    rv$bbox <- bbox
+    rv$bbox_visibility <- TRUE
   })
   
   # Function to crop raster to bounding box
@@ -169,31 +174,28 @@ server <- function(input, output, session) {
     return(cropped_raster)
   }
   
-  # Observer for updating cropped raster when custom bounding boxes change
-  observeEvent(rv$bboxes, {
-    if (!is.null(rv$bboxes) && length(rv$bboxes) > 0) {
-      cropped_raster_list <- lapply(rv$bboxes, function(bbox) {
-        crop_raster_to_bbox(raster_data[[which(basename(files_list) == input$species)]], bbox)
-      })
-      cropped_raster(raster::stack(cropped_raster_list))
+  # Observer for updating cropped raster when custom bounding box changes
+  observeEvent(rv$bbox, {
+    if (!is.null(rv$bbox)) {
+      cropped_raster(crop_raster_to_bbox(raster_data[[which(basename(files_list) == input$species)]], rv$bbox))
     } else {
       cropped_raster(NULL)
     }
   })
   
-  # Dynamically generate toggle buttons for custom bounding boxes
-  output$bbox_toggle_buttons <- renderUI({
-    toggle_buttons <- lapply(seq_along(rv$bboxes), function(i) {
-      checkboxInput(paste0("toggle_bbox_", i), paste("Toggle Bounding Box", i), value = TRUE)
-    })
-    do.call(tagList, toggle_buttons)
-  })
-  
-  # Event handler for toggling custom bounding boxes individually
-  observeEvent(input$toggle_bbox, {
-    bbox_index <- as.numeric(sub("toggle_bbox_", "", input$toggle_bbox))
-    rv$bbox_visibility[[bbox_index]] <- !rv$bbox_visibility[[bbox_index]]
-  })
+  # Download handler for cropped raster
+  output$download_cropped_raster <- downloadHandler(
+    filename = function() {
+      species_name <- selected_species()
+      species_name <- gsub(" ", "_", species_name)  # Replace space with underscore
+      file_name <- paste(species_name, "_custom_", Sys.Date(), ".tif", sep = "")
+    },
+    content = function(file) {
+      if (!is.null(cropped_raster())) {
+        writeRaster(cropped_raster(), filename = file, format = "GTiff")
+      }
+    }
+  )
 }
 
 # Run the Shiny app
